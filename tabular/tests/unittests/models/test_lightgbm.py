@@ -44,6 +44,14 @@ def test_lightgbm_quantile_model():
     )
 
 
+def test_lightgbm_binary_with_target_encoding():
+    fit_args = dict()
+    dataset_name = "toy_binary"
+
+    model = LGBModel(hyperparameters={"ag.target_encoding": True, "ag.target_encoding_folds": 3})
+    ModelFitHelper.fit_and_validate_dataset(dataset_name=dataset_name, model=model, fit_args=fit_args)
+
+
 def test_lightgbm_binary_with_calibrate_decision_threshold():
     """Tests that calibrate_decision_threshold works and does not make the validation score worse on the given metric"""
     fit_args = dict(

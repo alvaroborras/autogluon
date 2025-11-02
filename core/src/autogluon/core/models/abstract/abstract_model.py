@@ -18,6 +18,7 @@ import pandas as pd
 from typing_extensions import Self
 
 from autogluon.common.features.feature_metadata import FeatureMetadata
+from autogluon.common.features.types import R_CATEGORY, R_OBJECT, S_IMAGE_BYTEARRAY, S_IMAGE_PATH, S_TEXT
 from autogluon.common.space import Space
 from autogluon.common.utils.distribute_utils import DistributedContext
 from autogluon.common.utils.lite import disable_if_lite_mode
@@ -46,6 +47,7 @@ from ...utils.exceptions import NotEnoughMemoryError, NoValidFeatures, TimeLimit
 from ...utils.loaders import load_json, load_pkl
 from ...utils.savers import save_json, save_pkl
 from ...utils.time import sample_df_for_time_func, time_func
+from ...utils.target_encoder import CrossFoldTargetEncoder
 from ._tags import _DEFAULT_CLASS_TAGS, _DEFAULT_TAGS
 from .model_trial import model_trial, skip_hpo
 
@@ -283,6 +285,8 @@ class AbstractModel(ModelBase, Tunable):
 
         self._compiler = None
 
+        self._target_encoder: CrossFoldTargetEncoder | None = None
+
         # None is a valid value, "NOTSET" indicates `.init_random_seed` was not called yet.
         self.random_seed: int | None | str = "NOTSET"
 
@@ -497,6 +501,12 @@ class AbstractModel(ModelBase, Tunable):
             get_features_kwargs_extra=None,  # If not None, applies an additional feature filter to the result of get_feature_kwargs. This should be reserved for users and be None by default. | Currently undocumented in task.
             predict_1_batch_size=None,  # If not None, calculates `self.predict_1_time` at end of fit call by predicting on this many rows of data.
             temperature_scalar=None,  # Temperature scaling parameter that is set post-fit if calibrate=True during TabularPredictor.fit() on the model with the best validation score and eval_metric="log_loss".
+            target_encoding=False,
+            target_encoding_folds=5,
+            target_encoding_smoothing=10.0,
+            target_encoding_min_samples_leaf=1,
+            target_encoding_noise=0.0,
+            target_encoding_keep_original=True,
         )
         return default_auxiliary_params
 
@@ -584,6 +594,9 @@ class AbstractModel(ModelBase, Tunable):
         If preprocessing code will produce the same output regardless of which child model processes the input data, then it should live here to avoid redundant repeated processing for each child.
         This means this method cannot be used for data normalization. Refer to `_preprocess` instead.
         """
+        if self._target_encoder is not None:
+            if (not self._target_encoder.keep_original) or self._target_encoder.needs_augmentation(X):
+                X = self._target_encoder.transform(X)
         # TODO: In online-inference this becomes expensive, add option to remove it (only safe in controlled environment where it is already known features are present
         if list(X.columns) != self.features:
             X = X[self.features]
@@ -696,6 +709,143 @@ class AbstractModel(ModelBase, Tunable):
             )
         kwargs = self._preprocess_fit_resources(**kwargs)
         return kwargs
+
+    def _prepare_target_encoding_fit(self, *, kwargs: dict, params_aux: dict) -> tuple[dict, CrossFoldTargetEncoder | None]:
+        X = kwargs.get("X")
+        y = kwargs.get("y")
+        if X is None or y is None:
+            return kwargs, None
+
+        feature_metadata: FeatureMetadata | None = kwargs.get("feature_metadata", None)
+        columns_to_encode = self._determine_target_encoding_columns(
+            X=X,
+            feature_metadata=feature_metadata,
+        )
+        if not columns_to_encode:
+            return kwargs, None
+
+        if not isinstance(y, pd.Series):
+            y = pd.Series(y, index=X.index, name="target")
+        elif not y.index.equals(X.index):
+            y = y.reindex(X.index)
+        kwargs["y"] = y
+
+        sample_weight = kwargs.get("sample_weight", None)
+        if sample_weight is not None:
+            if not isinstance(sample_weight, pd.Series):
+                sample_weight = pd.Series(sample_weight, index=X.index, name="sample_weight")
+            elif not sample_weight.index.equals(X.index):
+                sample_weight = sample_weight.reindex(X.index)
+            kwargs["sample_weight"] = sample_weight
+
+        problem_type = self.problem_type if self.problem_type is not None else self._infer_problem_type(y=y)
+        num_classes = self.num_classes
+        if num_classes is None and problem_type in {BINARY, MULTICLASS}:
+            num_classes = int(y.nunique(dropna=True)) if len(y) else None
+
+        random_seed_specified = "random_seed" in kwargs
+        random_seed_kwarg = kwargs.get("random_seed", None)
+        if not random_seed_specified:
+            if isinstance(self.random_seed, (int, np.integer)):
+                random_state = int(self.random_seed)
+            else:
+                random_state = self.default_random_seed
+            kwargs["random_seed"] = random_state
+        else:
+            random_state = random_seed_kwarg
+            if isinstance(random_seed_kwarg, str):
+                if random_seed_kwarg == "auto":
+                    random_state = self.default_random_seed
+                    kwargs["random_seed"] = random_state
+                else:
+                    try:
+                        random_state = int(random_seed_kwarg)
+                        kwargs["random_seed"] = random_state
+                    except ValueError:
+                        random_state = None
+        if random_state is None and isinstance(self.random_seed, (int, np.integer)):
+            random_state = int(self.random_seed)
+
+        encoder = CrossFoldTargetEncoder(
+            columns=columns_to_encode,
+            problem_type=problem_type,
+            num_classes=num_classes,
+            n_folds=max(1, int(params_aux.get("target_encoding_folds", 5))),
+            smoothing=float(params_aux.get("target_encoding_smoothing", 10.0)),
+            min_samples_leaf=int(params_aux.get("target_encoding_min_samples_leaf", 1)),
+            noise=float(params_aux.get("target_encoding_noise", 0.0)),
+            keep_original=bool(params_aux.get("target_encoding_keep_original", True)),
+            random_state=random_state,
+        )
+
+        kwargs["X"] = encoder.fit_transform(X=kwargs["X"], y=y, sample_weight=sample_weight)
+
+        if encoder.encoded_feature_names_:
+            feature_metadata_aug = self._augment_feature_metadata_with_target_encoding(
+                feature_metadata=feature_metadata,
+                encoder=encoder,
+                params_aux=params_aux,
+                columns_encoded=columns_to_encode,
+                X=kwargs["X"],
+            )
+            kwargs["feature_metadata"] = feature_metadata_aug
+
+            for key in ("X_val", "X_test", "X_unlabeled", "X_pseudo"):
+                if key in kwargs and kwargs[key] is not None:
+                    kwargs[key] = encoder.transform(kwargs[key])
+        else:
+            encoder = None
+
+        return kwargs, encoder
+
+    @staticmethod
+    def _determine_target_encoding_columns(*, X: pd.DataFrame, feature_metadata: FeatureMetadata | None) -> list[str]:
+        if feature_metadata is not None:
+            candidate_features = feature_metadata.get_features(valid_raw_types=[R_CATEGORY, R_OBJECT])
+            excluded: set[str] = set()
+            for special_type in (S_TEXT, S_IMAGE_PATH, S_IMAGE_BYTEARRAY):
+                try:
+                    excluded.update(feature_metadata.get_features(required_special_types=[special_type]))
+                except KeyError:
+                    continue
+            columns = [col for col in candidate_features if col not in excluded and col in X.columns]
+        else:
+            columns = [
+                col
+                for col in X.columns
+                if pd.api.types.is_categorical_dtype(X[col]) or pd.api.types.is_object_dtype(X[col])
+            ]
+        return columns
+
+    def _augment_feature_metadata_with_target_encoding(
+        self,
+        *,
+        feature_metadata: FeatureMetadata | None,
+        encoder: CrossFoldTargetEncoder,
+        params_aux: dict,
+        columns_encoded: list[str],
+        X: pd.DataFrame,
+    ) -> FeatureMetadata | None:
+        if not encoder.encoded_feature_names_:
+            return feature_metadata
+
+        new_metadata = FeatureMetadata.from_df(X[encoder.encoded_feature_names_])
+
+        if feature_metadata is None:
+            return FeatureMetadata.from_df(X)
+
+        updated_metadata = feature_metadata
+        if not params_aux.get("target_encoding_keep_original", True):
+            existing_features = set(updated_metadata.get_features())
+            to_remove = [col for col in columns_encoded if col in existing_features]
+            if to_remove:
+                try:
+                    updated_metadata = updated_metadata.remove_features(to_remove)
+                except KeyError:
+                    pass
+
+        updated_metadata = updated_metadata.join_metadata(new_metadata, shared_raw_features="error")
+        return updated_metadata
 
     def initialize(self, **kwargs) -> dict:
         if not self._is_initialized:
@@ -1065,6 +1215,13 @@ class AbstractModel(ModelBase, Tunable):
             Any additional fit arguments a model supports.
         """
         time_start = time.time()
+
+        self._target_encoder = None
+        params_aux_pre = self._get_params_aux()
+        target_encoder = None
+        if params_aux_pre.get("target_encoding", False):
+            kwargs, target_encoder = self._prepare_target_encoding_fit(kwargs=kwargs, params_aux=params_aux_pre)
+
         kwargs = self.initialize(
             **kwargs
         )  # FIXME: This might have to go before self._preprocess_fit_args, but then time_limit might be incorrect in **kwargs init to initialize
@@ -1095,6 +1252,12 @@ class AbstractModel(ModelBase, Tunable):
         out = self._fit(**kwargs)
         if out is None:
             out = self
+        if target_encoder is not None and target_encoder.encoded_feature_names_:
+            out._target_encoder = target_encoder
+            out.params_trained["target_encoding_features"] = target_encoder.encoded_feature_names_
+        else:
+            out._target_encoder = None
+            out.params_trained.pop("target_encoding_features", None)
         out = out._post_fit(**kwargs)
         return out
 
